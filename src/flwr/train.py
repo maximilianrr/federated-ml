@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class ModelTrainer(): 
+class ModelTrainer: 
     def train_fn(self, model: nn.Module, criterion, optimizer, train_loader, device, num_epochs=5, proximal_mu=0.0):
         """
         Train the model on the given data.
