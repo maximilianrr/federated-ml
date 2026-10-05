@@ -6,6 +6,7 @@ from flwr.clientapp import ClientApp
 
 from flwr.train import ModelTrainer
 from flwr.test import ModelTester
+from src.flwr.model import VisionModel
 
 class FederatedClientManager: 
 
@@ -115,3 +116,17 @@ class FederatedClientManager:
             }),
             reply_to=msg
         )
+
+
+# Instantiate custom class with all required arguments
+client_manager = FederatedClientManager(
+    model_class=VisionModel,
+    criterion=torch.nn.CrossEntropyLoss(),
+    learning_rate=0.01,
+    train_loaders=TRAIN_LOADERS,
+    test_loaders=TEST_LOADERS,
+    input_size=128
+)
+
+# Expose the actual flwr ClientApp instance as `app`
+app = client_manager.app

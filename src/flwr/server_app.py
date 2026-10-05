@@ -5,13 +5,14 @@ import os
 
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
-from flwr.serverapp.strategy import FedAvg, FedProx
+from flwr.serverapp.strategy import FedAvg
 
 from src.flwr.test import ModelTester
+from src.flwr.model import VisionModel
 
 class FederatedServerManager: 
 
-    def __init__(self, model_class, global_test_loader, input_size, server_rounds=5, fraction_eval=0.2, num_classes=5, algorithm="fedavg", proximal_mu=0.1) -> None:
+    def __init__(self, model_class, global_test_loader, input_size, server_rounds=5, fraction_eval=0.2, num_classes=5) -> None:
             
             """
             Create a Flower ClientApp for federated learning.
@@ -23,8 +24,6 @@ class FederatedServerManager:
                 server_rounds (int): The number of rounds to run the server. Defaults to 5.
                 fraction_eval (float): The fraction of clients to evaluate. Defaults to 0.2.
                 num_classes (int): The number of output classes. Defaults to 5.
-                algorithm (str): The selected algorithm. Defaults to fedavg
-                proximal_mu (float): The proximal_mu for FedProx algorithm
             Returns:
                 ServerApp: A Flower ServerApp instance configured for federated learning.
             """
@@ -35,14 +34,11 @@ class FederatedServerManager:
             self.server_rounds = server_rounds
             self.fraction_eval = fraction_eval
             self.num_classes = num_classes
-            self.algorithm = algorithm
-            self.proximal_mu = proximal_mu
             self.history_metrics = {}
     
             # Instantiate Flower's ClientApp
             self.app = ServerApp()
             self.app.main()(self.main)
-            # self.app.evaluate()(self.evaluate)
 
 
     def main(self, grid: Grid, context: Context) -> None:
@@ -64,24 +60,15 @@ class FederatedServerManager:
             }
         }
 
-        if self.algorithm.lower() == "fedprox":
-            strategy = FedProx( 
-                fraction_evaluate=fraction_evaluate, 
-                proximal_mu=self.proximal_mu,
-            )
-            current_train_config = ConfigRecord({"proximal_mu": self.proximal_mu})
-
-        else:
-            strategy = FedAvg(
-                fraction_evaluate=fraction_evaluate
-            )
-            current_train_config = ConfigRecord({"proximal_mu": 0.0})
+        strategy = FedAvg(
+            fraction_evaluate=fraction_evaluate
+        )
         
         # Start strategy, run FedAvg for `num_rounds`
         result = strategy.start(
             grid=grid,
             initial_arrays=arrays,
-            train_config=current_train_config,
+            train_config=ConfigRecord(),
             num_rounds=num_rounds,
             evaluate_fn=self.global_evaluate,
         )
@@ -91,10 +78,10 @@ class FederatedServerManager:
         os.makedirs("outputs", exist_ok=True)
         
         state_dict = result.arrays.to_torch_state_dict()
-        torch.save(state_dict, f"final_model_{self.algorithm.lower()}.pt")
+        torch.save(state_dict, f"final_model_fedavg.pt")
 
         # Save metrics JSON directly from the tracker
-        with open(f"outputs/global_{self.algorithm}_baseline.json", "w") as f:
+        with open(f"outputs/global_fedavg_baseline.json", "w") as f:
             json.dump(self.history_metrics, f)
 
 
@@ -119,3 +106,12 @@ class FederatedServerManager:
 
         metrics = {"test_loss": test_loss, "test_accuracy": test_acc}
         return MetricRecord(metrics)
+
+
+server_manager = FederatedServerManager(
+    model_class=VisionModel, 
+    global_test_loader=TEST_LOADER, 
+    input_size=128
+)
+
+server_app = server_manager.app
