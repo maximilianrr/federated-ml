@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local datasets and training artifacts
+/data/
+/data_cache*/
+/outputs/
+*.fab

@@ -1,117 +1,79 @@
 import json
-import torch
-import torch.nn as nn
-import os
+from pathlib import Path
 
+import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg
 
-from src.flwr.test import ModelTester
+from src.data import load_federated_data
 from src.flwr.model import VisionModel
+from src.flwr.test import evaluate
+from src.flwr.train import get_device
 
-class FederatedServerManager: 
-
-    def __init__(self, model_class, global_test_loader, input_size, server_rounds=5, fraction_eval=0.2, num_classes=5) -> None:
-            
-            """
-            Create a Flower ClientApp for federated learning.
-    
-            Args:
-                model_class (nn.Module): The PyTorch model class to be used.
-                global_test_loader (DataLoader): DataLoader for the global test data.
-                input_size (int): The size of the input features.
-                server_rounds (int): The number of rounds to run the server. Defaults to 5.
-                fraction_eval (float): The fraction of clients to evaluate. Defaults to 0.2.
-                num_classes (int): The number of output classes. Defaults to 5.
-            Returns:
-                ServerApp: A Flower ServerApp instance configured for federated learning.
-            """
-    
-            self.model_class = model_class
-            self.global_test_loader = global_test_loader
-            self.input_size = input_size
-            self.server_rounds = server_rounds
-            self.fraction_eval = fraction_eval
-            self.num_classes = num_classes
-            self.history_metrics = {}
-    
-            # Instantiate Flower's ClientApp
-            self.app = ServerApp()
-            self.app.main()(self.main)
+app = ServerApp()
 
 
-    def main(self, grid: Grid, context: Context) -> None:
-        num_rounds_raw = context.run_config.get("num-server-rounds", self.server_rounds)
-        num_rounds = int(num_rounds_raw)
+@app.main()
+def main(grid: Grid, context: Context):
+    torch.manual_seed(int(context.run_config["seed"]))
+    data = load_federated_data(str(context.run_config["cache-dir"]))
+    device = get_device()
+    output = Path(str(context.run_config["output-dir"]))
+    output.mkdir(parents=True, exist_ok=True)
+    model = VisionModel(num_classes=data.num_classes)
+    initial_arrays = ArrayRecord(model.state_dict())
+    best_score, best_state = float("-inf"), None
+    history = []
 
-        fraction_raw = context.run_config.get("fraction-evaluate", self.fraction_eval)
-        fraction_evaluate = float(fraction_raw)
+    def validate(server_round, arrays):
+        nonlocal best_score, best_state
+        model.load_state_dict(arrays.to_torch_state_dict())
+        metrics = evaluate(model, data.centralized_val_loader, device)
 
-        # initialize the global model dynamically 
-        global_model = self.model_class(input_size=self.input_size, num_classes=self.num_classes)
-        arrays = ArrayRecord(global_model.state_dict())
-
-        # create own history tracker
-        self.history_metrics = {
-            "metrics_centralized": {
-                "test_accuracy": [],
-                "test_loss": []
-            }
-        }
-
-        strategy = FedAvg(
-            fraction_evaluate=fraction_evaluate
-        )
+        if metrics["evaluated_labels"] != data.num_classes:
+            raise ValueError("Validation needs positive and negative examples for every finding")
         
-        # Start strategy, run FedAvg for `num_rounds`
-        result = strategy.start(
-            grid=grid,
-            initial_arrays=arrays,
-            train_config=ConfigRecord(),
-            num_rounds=num_rounds,
-            evaluate_fn=self.global_evaluate,
-        )
-    
-        # Save final model to disk
-        print("\nSaving final model to disk...")
-        os.makedirs("outputs", exist_ok=True)
-        
-        state_dict = result.arrays.to_torch_state_dict()
-        torch.save(state_dict, f"final_model_fedavg.pt")
+        history.append({"round": server_round, **metrics})
 
-        # Save metrics JSON directly from the tracker
-        with open(f"outputs/global_fedavg_baseline.json", "w") as f:
-            json.dump(self.history_metrics, f)
+        if metrics["macro_ap"] > best_score:
+            best_score = metrics["macro_ap"]
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            torch.save({
+                "state_dict": best_state,
+                "round": server_round,
+                "validation_metrics": metrics,
+                "data_meta": data.meta,
+            }, output / "best_model.pt")
 
-
-    # the evaluate function closure has access to global_test_loader
-    def global_evaluate(self, server_round: int, parameters: ArrayRecord):
-        if self.global_test_loader is None:
-            return None
-        
-        model = self.model_class(input_size=self.input_size, num_classes=self.num_classes)
-        model.load_state_dict(parameters.to_torch_state_dict())
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-
-        tester = ModelTester()
-
-        criterion = nn.CrossEntropyLoss()
-        test_loss, test_acc = tester.test_fn(model, criterion, self.global_test_loader, device)
-
-        # Update the history metrics
-        self.history_metrics["metrics_centralized"]["test_accuracy"].append([server_round, test_acc])
-        self.history_metrics["metrics_centralized"]["test_loss"].append([server_round, test_loss])
-
-        metrics = {"test_loss": test_loss, "test_accuracy": test_acc}
+        (output / "validation_history.json").write_text(json.dumps(history, indent=2))
         return MetricRecord(metrics)
 
+    strategy = FedAvg(
+        fraction_train=1.0,
+        fraction_evaluate=0.0,
+        min_train_nodes=data.num_clients,
+        min_available_nodes=data.num_clients,
+        weighted_by_key="num-examples",
+    )
 
-server_manager = FederatedServerManager(
-    model_class=VisionModel, 
-    global_test_loader=TEST_LOADER, 
-    input_size=128
-)
+    result = strategy.start(
+        grid=grid,
+        initial_arrays=initial_arrays,
+        num_rounds=int(context.run_config["num-server-rounds"]),
+        timeout=21600,
+        train_config=ConfigRecord({
+            "learning-rate": float(context.run_config["learning-rate"]),
+            "local-epochs": int(context.run_config["local-epochs"]),
+        }),
+        evaluate_fn=validate,
+    )
 
-server_app = server_manager.app
+    torch.save(result.arrays.to_torch_state_dict(), output / "final_model.pt")
+
+    if best_state is None:
+        raise RuntimeError("No validated checkpoint was produced")
+    
+    model.load_state_dict(best_state)
+    metrics = evaluate(model, data.global_test_loader, device)
+    (output / "test_metrics.json").write_text(json.dumps(metrics, indent=2))
