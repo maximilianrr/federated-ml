@@ -11,9 +11,14 @@ training pipeline are not final yet. It only needs per-sample losses, and can ge
 
 * model: an ``nn.Module``, any callable returning logits (tensor / array / tuple / object with
   ``.logits``), or a path or dict holding a state_dict (together with ``model_factory``).
-* data: a DataLoader or any iterable of batches (``(x, y)`` or dicts), a torch Dataset, a list
-  of ``(x, y)`` samples, a tuple ``(X, y)``, or precomputed values: a 1-D array of losses,
-  ``{"losses": ...}`` or ``{"logits": ..., "labels": ...}``.
+* data: a DataLoader or any iterable of batches (``(x, y)``, ``(x, y, mask)`` or dicts), a
+  torch Dataset, a list of ``(x, y)`` samples, a tuple ``(X, y)`` or ``(X, y, mask)``, or
+  precomputed values: a 1-D array of losses, ``{"losses": ...}`` or
+  ``{"logits": ..., "labels": ...}`` (optionally with ``"mask"``).
+
+For multi-label data, a mask with the same shape as the labels marks which labels count
+(1 = use, 0 = ignore, e.g. uncertain findings). This matches ``masked_bce`` in
+``src/flwr/train.py``, so the attack sees the same per-image loss the model was trained on.
 
 Example:
     attack = LossThresholdAttack(n_bootstrap=200)
@@ -22,6 +27,7 @@ Example:
 """
 
 import contextlib
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
@@ -35,6 +41,7 @@ from torch.utils.data import DataLoader, RandomSampler
 # keys that are recognised when a batch is a dict (e.g. HuggingFace / flwr-datasets style)
 _X_KEYS = ("image", "img", "x", "input", "inputs", "data", "pixel_values")
 _Y_KEYS = ("label", "labels", "y", "target", "targets")
+_MASK_KEYS = ("mask", "masks", "label_mask")
 _EPS = 1e-12
 
 
@@ -147,29 +154,44 @@ def _as_tensor(x) -> torch.Tensor:
 
 
 def _split_batch(batch):
-    """Get ``(inputs, labels)`` out of a batch that is a tuple, list or dict."""
+    """
+    Get ``(inputs, labels, extra)`` out of a batch that is a tuple, list or dict.
+
+    ``extra`` is the third element (or the dict's mask entry), or None. Whether it really is
+    a label mask is decided by ``_mask_from``; anything else (ids, ...) is ignored.
+    """
     if isinstance(batch, Mapping):
         x = next((batch[k] for k in _X_KEYS if k in batch), None)
         y = next((batch[k] for k in _Y_KEYS if k in batch), None)
         if x is None or y is None:
             raise KeyError(f"Batch keys {list(batch)} do not contain an input key "
                            f"{_X_KEYS} and a label key {_Y_KEYS}.")
-        return x, y
+        return x, y, next((batch[k] for k in _MASK_KEYS if k in batch), None)
     if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-        return batch[0], batch[1]  # anything after the labels (ids, ...) is ignored
+        return batch[0], batch[1], batch[2] if len(batch) >= 3 else None
     raise TypeError(f"Cannot read a batch of type {type(batch).__name__}; "
                     "expected (inputs, labels) or a dict.")
 
 
+def _mask_from(extra, labels) -> Optional[torch.Tensor]:
+    """``extra`` as a boolean label mask, or None if it is not one (e.g. sample ids)."""
+    if extra is None:
+        return None
+    extra = _as_tensor(extra)
+    if labels.ndim >= 2 and extra.shape == labels.shape:
+        return extra.bool()
+    return None
+
+
 def _batches(data, batch_size: int):
-    """Yield ``(inputs, labels)`` from any of the supported data containers."""
+    """Yield ``(inputs, labels, extra)`` from any of the supported data containers."""
     if isinstance(data, DataLoader):
         iterator = data
-    elif isinstance(data, tuple) and len(data) == 2:
-        x, y = _as_tensor(data[0]), _as_tensor(data[1])
-        if len(x) != len(y):
-            raise ValueError(f"X has {len(x)} rows but y has {len(y)}.")
-        iterator = ((x[i:i + batch_size], y[i:i + batch_size]) for i in range(0, len(x), batch_size))
+    elif isinstance(data, tuple) and len(data) in (2, 3):
+        arrays = [_as_tensor(a) for a in data]
+        if any(len(a) != len(arrays[0]) for a in arrays):
+            raise ValueError(f"The arrays in the tuple have different lengths: {[len(a) for a in arrays]}.")
+        iterator = (tuple(a[i:i + batch_size] for a in arrays) for i in range(0, len(arrays[0]), batch_size))
     elif hasattr(data, "__len__") and hasattr(data, "__getitem__"):
         # torch Dataset or list of samples; never shuffled so the order stays reproducible
         iterator = DataLoader(data, batch_size=batch_size, shuffle=False)
@@ -203,7 +225,7 @@ def load_model(model, model_factory: Optional[Callable[[], nn.Module]] = None, d
             to a file written by ``torch.save(state_dict, path)``. Checkpoints that wrap the
             weights under ``model_state_dict`` / ``state_dict`` / ``model`` also work.
         model_factory (callable): Builds an empty model to load the weights into, e.g.
-            ``lambda: VisionModel(input_size=1296, num_classes=5)``. Needed for state_dicts.
+            ``lambda: VisionModel(num_classes=5)``. Needed for state_dicts.
         device: Where to load the weights. Defaults to the CPU.
     Returns:
         The model, ready to call.
@@ -226,6 +248,14 @@ def load_model(model, model_factory: Optional[Callable[[], nn.Module]] = None, d
     return network.to(device) if device is not None else network
 
 
+def _takes_three_args(fn) -> bool:
+    try:
+        inspect.signature(fn).bind(None, None, None)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 # ----------------------------------------------------------------------------------------
 # the attack
 # ----------------------------------------------------------------------------------------
@@ -239,12 +269,15 @@ class LossThresholdAttack:
             ``None`` picks automatically: ``"bce"`` (multi-label, or a single logit) when the
             labels have the same shape as the logits, otherwise ``"ce"`` (single-label).
             ``"ce"`` also accepts one-hot labels. A callable ``f(logits, labels)`` must return
-            one loss per sample, shape ``(N,)``.
+            one loss per sample, shape ``(N,)``; if it takes a third argument and the data has a
+            mask, it is called as ``f(logits, labels, mask)``.
         from_probs (bool): Set to True if the model outputs probabilities instead of logits.
         ignore_label (float | None): Label entries equal to this value (e.g. -1 for the
             "uncertain" CheXpert labels) are left out of the multi-label loss.
         label_reduction (str): How the multi-label loss is combined across labels, ``"mean"``
             or ``"sum"``.
+        use_mask (bool): Use a label mask when the data provides one (see the module
+            docstring). Set to False to score every label.
         batch_size (int): Batch size used when the data is not already in a DataLoader.
         device: Device to run the model on. Defaults to the model's own device, else the CPU.
         n_bootstrap (int): Number of bootstrap resamples for the AUROC confidence interval.
@@ -254,7 +287,7 @@ class LossThresholdAttack:
     """
 
     def __init__(self, loss_fn=None, from_probs=False, ignore_label=None, label_reduction="mean",
-                 batch_size=64, device=None, n_bootstrap=0, fpr_targets=(0.01, 0.001), seed=0):
+                 use_mask=True, batch_size=64, device=None, n_bootstrap=0, fpr_targets=(0.01, 0.001), seed=0):
         if label_reduction not in ("mean", "sum"):
             raise ValueError("label_reduction must be 'mean' or 'sum'.")
         if isinstance(loss_fn, str) and loss_fn not in ("ce", "bce"):
@@ -264,6 +297,7 @@ class LossThresholdAttack:
         self.from_probs = from_probs
         self.ignore_label = ignore_label
         self.label_reduction = label_reduction
+        self.use_mask = use_mask
         self.batch_size = batch_size
         self.device = device
         self.n_bootstrap = n_bootstrap
@@ -288,7 +322,9 @@ class LossThresholdAttack:
             if "losses" in data:
                 return self._check(np.asarray(_as_tensor(data["losses"]), dtype=float).ravel())
             if "logits" in data and "labels" in data:
-                loss = self._loss_from_outputs(_as_tensor(data["logits"]).float(), _as_tensor(data["labels"]))
+                labels = _as_tensor(data["labels"])
+                mask = _mask_from(next((data[k] for k in _MASK_KEYS if k in data), None), labels)
+                loss = self._loss_from_outputs(_as_tensor(data["logits"]).float(), labels, mask)
                 return self._check(loss.numpy())
             raise KeyError("A dict of precomputed values needs 'losses' or both 'logits' and 'labels'.")
         if isinstance(data, (np.ndarray, torch.Tensor)) and data.ndim == 1:
@@ -303,9 +339,11 @@ class LossThresholdAttack:
 
         all_losses = []
         with _eval_mode(model), torch.no_grad():
-            for x, y in _batches(data, self.batch_size):
+            for x, y, extra in _batches(data, self.batch_size):
                 logits = self._forward(model, _as_tensor(x).to(device))
-                loss = self._loss_from_outputs(logits, _as_tensor(y).to(device))
+                y = _as_tensor(y).to(device)
+                mask = _mask_from(extra, y)
+                loss = self._loss_from_outputs(logits, y, None if mask is None else mask.to(device))
                 all_losses.append(loss.cpu())
 
         if not all_losses:
@@ -328,10 +366,17 @@ class LossThresholdAttack:
             out = out[0]
         return _as_tensor(out).float()
 
-    def _loss_from_outputs(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def _loss_from_outputs(self, logits: torch.Tensor, labels: torch.Tensor,
+                           mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         logits = logits.detach()
+        if not self.use_mask:
+            mask = None
         if callable(self.loss_fn):
-            return _as_tensor(self.loss_fn(logits, labels)).detach().reshape(-1).float().cpu()
+            if mask is not None and _takes_three_args(self.loss_fn):
+                loss = self.loss_fn(logits, labels, mask.to(labels.dtype))
+            else:
+                loss = self.loss_fn(logits, labels)
+            return _as_tensor(loss).detach().reshape(-1).float().cpu()
 
         kind = self.loss_fn
         if kind is None:
@@ -339,6 +384,9 @@ class LossThresholdAttack:
             kind = "bce" if single_logit or labels.shape == logits.shape else "ce"
 
         if kind == "ce":
+            if mask is not None:
+                raise ValueError("A label mask only applies to multi-label (BCE) losses; "
+                                 "pass loss_fn='bce' or use_mask=False.")
             if logits.ndim == 2 and labels.shape == logits.shape:
                 labels = labels.argmax(dim=1)  # one-hot labels
             labels = labels.reshape(-1).long()
@@ -356,6 +404,8 @@ class LossThresholdAttack:
         valid = torch.ones_like(logits, dtype=torch.bool)
         if self.ignore_label is not None:
             valid = labels != self.ignore_label
+        if mask is not None:
+            valid = valid & mask.reshape(logits.shape)
         labels = torch.where(valid, labels, torch.zeros_like(labels)).float()
 
         if self.from_probs:

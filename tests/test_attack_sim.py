@@ -1,12 +1,13 @@
 """
 Tests for src/attack_sim.py.
 
-Run with ``pytest tests`` or ``python tests/test_attack_sim.py`` from the repository root.
+Run with ``python -m unittest discover -s tests -v`` (or ``pytest tests``) from the repository root.
 """
 
 import os
 import sys
 import tempfile
+import unittest
 
 import numpy as np
 import torch
@@ -139,6 +140,42 @@ def test_multilabel_with_ignored_labels():
     assert np.allclose(total, got * 13, atol=1e-4)
 
 
+def test_label_mask_from_batches_matches_masked_bce():
+    # the MIMIC loaders yield (image, target, mask); uncertain findings have mask 0
+    g = torch.Generator().manual_seed(0)
+    logits, targets = torch.randn(40, 5, generator=g), (torch.rand(40, 5, generator=g) < 0.3).float()
+    mask = (torch.rand(40, 5, generator=g) < 0.7).float()
+    expected = ((nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none") * mask)
+                .sum(1) / mask.sum(1).clamp_min(1)).numpy()
+
+    model = lambda x: x  # the "inputs" are the logits themselves
+    attack = LossThresholdAttack()
+    for name, data in {
+        "triple loader": DataLoader(TensorDataset(logits, targets, mask), batch_size=8),
+        "triple tuple": (logits, targets, mask),
+        "dict batches": iter([{"x": logits[:25], "y": targets[:25], "mask": mask[:25]},
+                              {"x": logits[25:], "y": targets[25:], "mask": mask[25:]}]),
+    }.items():
+        assert np.allclose(attack.losses(data, model), expected, atol=1e-6), name
+    assert np.allclose(attack.losses({"logits": logits, "labels": targets, "mask": mask}), expected, atol=1e-6)
+
+    unmasked = LossThresholdAttack(use_mask=False).losses((logits, targets, mask), model)
+    assert not np.allclose(unmasked, expected)
+
+    # a three-argument loss function receives the mask
+    seen = []
+    def custom(lg, lb, m):
+        seen.append(m)
+        return lg.mean(1)
+    LossThresholdAttack(loss_fn=custom).losses((logits, targets, mask), model)
+    assert torch.equal(torch.cat(seen), mask)
+
+    # a third element that is not a mask (e.g. ids) is still ignored for single-label data
+    y = torch.randint(0, 5, (40,))
+    with_ids = LossThresholdAttack().losses((logits, y, torch.arange(40)), model)
+    assert np.allclose(with_ids, LossThresholdAttack().losses((logits, y), model))
+
+
 def test_probabilities_binary_and_custom_loss():
     logits = torch.randn(40, 4)
     y = torch.randint(0, 4, (40,))
@@ -255,9 +292,15 @@ def test_bad_inputs_raise_clear_errors():
         pass
 
 
+class AttackSimTests(unittest.TestCase):
+    """Collects the test functions above so ``unittest discover`` runs them too."""
+
+
+for _name, _fn in list(globals().items()):
+    if _name.startswith("test_"):
+        setattr(AttackSimTests, _name, staticmethod(_fn))
+del _name, _fn  # otherwise _fn still points at the class and unittest collects it twice
+
+
 if __name__ == "__main__":
-    tests = {k: v for k, v in sorted(globals().items()) if k.startswith("test_")}
-    for name, fn in tests.items():
-        fn()
-        print("ok  ", name)
-    print(f"{len(tests)} tests passed")
+    unittest.main()
