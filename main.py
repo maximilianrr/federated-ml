@@ -3,8 +3,6 @@
 import argparse
 import json
 from pathlib import Path
-import subprocess
-import sys
 import tomllib
 
 from src.experiments import MODES, train_centralized
@@ -49,17 +47,9 @@ def main():
             )
             train_centralized(config.copy(), data)
         else:
-            overrides = " ".join(
-                f"{key}={json.dumps(config[key])}" for key in (
-                    "cache-dir", "output-dir", "mode", "num-server-rounds",
-                )
-            )
-            subprocess.run([
-                str(Path(sys.executable).with_name("flwr")), "run", str(root), "--stream",
-                "--run-config", overrides, "--federation-config",
-                f'num-supernodes={meta["num_clients"]} init-args-num-cpus=2 '
-                "init-args-num-gpus=0 client-resources-num-cpus=2 client-resources-num-gpus=0",
-            ], cwd=root, check=True)
+            from src.flwr.simulation import run_federated
+
+            run_federated(config.copy(), int(meta["num_clients"]))
 
 
 if __name__ == "__main__":

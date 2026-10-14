@@ -23,6 +23,7 @@ def train(msg: Message, context: Context):
     model = VisionModel(num_classes=data.num_classes)
     model.load_state_dict(msg.content["arrays"].to_torch_state_dict())
     loader = data.train_loaders[partition_id]
+    print(f"Client {partition_id}, round {config['server-round']}: training", flush=True)
     metrics = {"num-examples": len(loader.dataset)}
     if str(context.run_config["mode"]).startswith("dp_"):
         previous = context.state.get("privacy")
@@ -34,6 +35,7 @@ def train(msg: Message, context: Context):
             model, loader, get_device(), data.meta["pos_weight"],
             learning_rate=float(config["learning-rate"]), epochs=int(config["local-epochs"]),
         )
+    print(f"Client {partition_id}, round {config['server-round']}: finished", flush=True)
     return Message(
         content=RecordDict({
             "arrays": ArrayRecord(model.cpu().state_dict()),

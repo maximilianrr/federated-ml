@@ -60,7 +60,7 @@ def main(grid: Grid, context: Context):
         train_config=ConfigRecord(train_config), evaluate_fn=validate,
     )
 
-    if result.arrays is None:
+    if not result.arrays:
         raise RuntimeError("No client updates were aggregated")
     
     experiment.model.load_state_dict(result.arrays.to_torch_state_dict())

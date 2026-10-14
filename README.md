@@ -30,7 +30,10 @@ epochs as the federated conditions, while preserving its optimizer between group
 
 The app configuration keeps cache-dir = "data_cache" and output-dir = "outputs".
 The launcher resolves them relative to the project and runs one Flower client at
-a time. Training uses MPS on supported Macs, then CUDA or CPU. DP computes
+a time through Flower's Python simulation API in the active environment. Worker
+logs appear directly in the terminal; the launcher does not use the managed local
+SuperLink service or create another dependency environment. Training uses MPS on
+supported Macs, then CUDA or CPU. DP computes
 per-image gradients in chunks capped at 8 to bound gradient memory. Noise is drawn
 on CPU and transferred to the training device for MPS compatibility.
 
