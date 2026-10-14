@@ -19,13 +19,14 @@ def masked_bce(logits, targets, masks, pos_weight=None):
     return (losses * masks).sum(1) / masks.sum(1).clamp_min(1)
 
 
-def train_local(model, loader, device, pos_weight, learning_rate=1e-3, epochs=1):
+def train_local(model, loader, device, pos_weight, learning_rate=1e-3, epochs=1, optimizer=None):
     if epochs < 1 or learning_rate <= 0:
         raise ValueError("epochs and learning_rate must be positive")
     
     model.to(device).train()
     weights = torch.as_tensor(pos_weight, dtype=torch.float32, device=device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    if optimizer is None:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     total_loss = torch.zeros((), device=device)
     total_examples = 0
 

@@ -50,6 +50,8 @@ def build_label_table(cfg: PrepConfig) -> pd.DataFrame:
         _find_file(root, "*metadata.csv*"),
         usecols=["dicom_id", "subject_id", "study_id", "ViewPosition"],
     )
+    downloaded = {path.stem for path in (root / "files").rglob("*.jpg")}
+    metadata = metadata[metadata["dicom_id"].isin(downloaded)]
     labels = pd.read_csv(_find_file(root, "*chexpert.csv*"))
     missing = set(classes) - set(labels.columns)
 
@@ -68,27 +70,30 @@ def build_label_table(cfg: PrepConfig) -> pd.DataFrame:
     # Blank -> negative; uncertain -> ignored. Keep multiple positive findings.
     df = df[df[classes].fillna(0).ne(-1).any(axis=1)].copy()
 
-    if cfg.max_patients is not None:
-        if cfg.max_patients < 1:
-            raise ValueError("max_patients must be positive")
-        
-        patients = np.sort(df["subject_id"].unique())
-        selected = np.random.default_rng(cfg.seed).choice(
-            patients, size=min(cfg.max_patients, len(patients)), replace=False,
-        )
-        df = df[df["subject_id"].isin(selected)].copy()
-
     if df.empty:
-        raise ValueError("No eligible images")
-    
-    df = df.sort_values(["subject_id", "study_id", "dicom_id"]).reset_index(drop=True)
+        raise ValueError(f"No eligible JPG images under {root / 'files'}")
+
     df["path"] = df.apply(
         lambda r: (
             f"files/p{str(int(r.subject_id))[:2]}/p{int(r.subject_id)}"
             f"/s{int(r.study_id)}/{r.dicom_id}.jpg"
         ), axis=1,
     )
-    return df
+    # Filter the downloaded cohort before patient sampling, splitting, and statistics.
+    available = df["path"].map(lambda path: (root / path).is_file())
+    print(f"Available frontal images: {int(available.sum()):,}/{len(df):,}")
+    df = df.loc[available].copy()
+    if cfg.max_patients is not None:
+        if cfg.max_patients < 1:
+            raise ValueError("max_patients must be positive")
+        patients = np.sort(df["subject_id"].unique())
+        selected = np.random.default_rng(cfg.seed).choice(
+            patients, size=min(cfg.max_patients, len(patients)), replace=False,
+        )
+        df = df[df["subject_id"].isin(selected)].copy()
+    if df.empty:
+        raise ValueError(f"No eligible JPG images under {root / 'files'}")
+    return df.sort_values(["subject_id", "study_id", "dicom_id"]).reset_index(drop=True)
 
 
 def assign_splits(df: pd.DataFrame, cfg: PrepConfig) -> pd.DataFrame:
