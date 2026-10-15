@@ -53,6 +53,7 @@ class Experiment:
             (self.output / "privacy.json").write_text(json.dumps(self.privacy, indent=2))
 
         self.history.append({"round": step, **metrics})
+        
         if metrics["macro_ap"] > self.best_score:
             self.best_score = metrics["macro_ap"]
             torch.save({

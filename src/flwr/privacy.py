@@ -55,15 +55,19 @@ def epsilon_for_steps(sample_rate, noise_multiplier, steps, delta):
 def calibrate_noise(sample_rate, steps, epsilon, delta):
     if not math.isfinite(epsilon) or epsilon <= math.log(1 / delta) / (max(ORDERS) - 1):
         raise ValueError("Requested epsilon is too small for the configured accountant orders")
+    
     low, high = 0.0, 1.0
     while epsilon_for_steps(sample_rate, high, steps, delta) > epsilon:
         high *= 2
+
     for _ in range(40):
         middle = (low + high) / 2
+
         if epsilon_for_steps(sample_rate, middle, steps, delta) > epsilon:
             low = middle
         else:
             high = middle
+
     return high
 
 
@@ -83,6 +87,7 @@ def clipped_gradients(model, images, targets, masks, clip):
         gradient.flatten(1).square().sum(1) for gradient in gradients.values()
     ]).sum(0).sqrt()
     factors = (clip / (norms + 1e-6)).clamp(max=1)
+
     return {
         name: torch.einsum("i,i...->...", factors, gradient)
         for name, gradient in gradients.items()
@@ -95,19 +100,24 @@ def train_private(model, loader, config, previous=None):
     epsilon, delta = float(config["target-epsilon"]), float(config["dp-delta"])
     clip, physical_batch = float(config["dp-max-grad-norm"]), int(config["dp-physical-batch-size"])
     size = len(loader.dataset)
+
     if epochs < 1 or rounds < 1 or not 1 <= server_round <= rounds:
         raise ValueError("Invalid DP round/epoch configuration")
+    
     if size < 1 or not 0 < delta < 1 / size or not math.isfinite(clip) or clip <= 0 or physical_batch < 1:
         raise ValueError("Use positive DP parameters and delta < 1 / client training size")
 
     batch_size = min(loader.batch_size, size)
     sample_rate, steps_per_round = batch_size / size, epochs * math.ceil(size / batch_size)
     parameters = json.dumps([epsilon, delta, clip, epochs, rounds, batch_size, size])
+
     if previous is not None:
         if previous["round"] != server_round - 1 or previous["parameters"] != parameters:
             raise ValueError("DP rounds must be consecutive with unchanged privacy parameters")
+        
         if previous["steps"] != (server_round - 1) * steps_per_round:
             raise ValueError("The saved privacy step count does not match previous rounds")
+        
     elif server_round != 1:
         raise ValueError("Missing privacy accounting state from previous rounds")
 
@@ -125,16 +135,21 @@ def train_private(model, loader, config, previous=None):
     for _ in range(steps_per_round):
         indices = torch.nonzero(torch.rand(size, generator=sampler) < sample_rate).flatten().tolist()
         summed = {name: torch.zeros_like(parameter) for name, parameter in model.named_parameters()}
+
         for start in range(0, len(indices), physical_batch):
             batch = loader.collate_fn([loader.dataset[i] for i in indices[start:start + physical_batch]])
             images, targets, masks = (tensor.to(device) for tensor in batch)
             gradients = clipped_gradients(model, images, targets, masks, clip)
+
             for name in summed:
                 summed[name].add_(gradients[name])
+
         optimizer.zero_grad(set_to_none=True)
+
         for name, parameter in model.named_parameters():
             perturbation = torch.randn(parameter.shape, generator=noise, dtype=parameter.dtype).to(device)
             parameter.grad = (summed[name] + perturbation * (sigma * clip)) / batch_size
+
         # Empty Poisson draws still produce noisy, accounted optimizer steps.
         optimizer.step()
         steps += 1
@@ -142,6 +157,7 @@ def train_private(model, loader, config, previous=None):
     spent = epsilon_for_steps(sample_rate, sigma, steps, delta)
     if spent > epsilon + 1e-6:
         raise RuntimeError("The accumulated privacy budget exceeded its configured target")
+    
     return {
         "epsilon": spent, "delta": delta, "noise_multiplier": sigma,
         "sample_rate": sample_rate, "steps": steps,
